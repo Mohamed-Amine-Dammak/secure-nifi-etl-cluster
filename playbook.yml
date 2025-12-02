@@ -1,0 +1,217 @@
+---
+- name: Setup Apache NiFi Cluster Node (slave1/slave2)
+  hosts: slaves
+  become: yes
+  vars:
+    nifi_version: "1.26.0"
+    nifi_install_dir: "/opt"
+    nifi_home: "/opt/nifi-1.26.0"
+    nifi_user: "master1"
+    hostname: "{{ inventory_hostname }}"
+    sensitive_props_key: "1pHZH5eK1yDAQxRX3BZIJhAOHrwEjXbq"
+  tasks:
+
+    - name: Ensure unzip is installed
+      apt:
+        name: ["unzip"]
+        state: present
+
+    - name: Download Apache NiFi
+      get_url:
+        url: "https://archive.apache.org/dist/nifi/{{ nifi_version }}/nifi-{{ nifi_version }}-bin.zip"
+        dest: "/tmp/nifi-{{ nifi_version }}-bin.zip"
+        mode: '0644'
+
+    - name: Extract Apache NiFi
+      unarchive:
+        src: "/tmp/nifi-{{ nifi_version }}-bin.zip"
+        dest: "{{ nifi_install_dir }}"
+        remote_src: yes
+
+    - name: Rename extracted NiFi directory to nifi
+      command: mv {{ nifi_install_dir }}/nifi-{{ nifi_version }} {{ nifi_home }}
+      args:
+        removes: "{{ nifi_home }}"
+
+    - name: Start NiFi once to allow it to generate keystore and truststore passwords
+      shell: "{{ nifi_home }}/bin/nifi.sh start"
+
+    - name: Wait for NiFi to generate config and shut it down
+      shell: "sleep 120 && {{ nifi_home }}/bin/nifi.sh stop"
+
+    - name: Wait for nifi.properties to exist
+      wait_for:
+        path: "{{ nifi_home }}/conf/nifi.properties"
+        state: present
+        timeout: 60
+
+    - name: Set cluster and HTTPS properties in nifi.properties
+      lineinfile:
+        path: "{{ nifi_home }}/conf/nifi.properties"
+        regexp: "^{{ item.regexp }}"
+        line: "{{ item.line }}"
+        create: no
+      loop:
+        - { regexp: 'nifi.web.https.host=.*', line: 'nifi.web.https.host={{ inventory_hostname }}' }
+        - { regexp: 'nifi.sensitive.props.key=.*', line: 'nifi.sensitive.props.key={{ sensitive_props_key }}' }
+        - { regexp: 'nifi.cluster.node.address=.*', line: 'nifi.cluster.node.address={{ inventory_hostname }}' }
+        - { regexp: 'nifi.cluster.nodes=.*', line: 'nifi.cluster.nodes={{ inventory_hostname }}' }
+        - { regexp: 'nifi.zookeeper.connect.string=.*', line: 'nifi.zookeeper.connect.string=master1:2181,master2:2181,master3:2181' }
+        - { regexp: 'nifi.cluster.protocol.is.secure=.*', line: 'nifi.cluster.protocol.is.secure=true' }
+        - { regexp: 'nifi.cluster.flow.election.max.wait.time=.*', line: 'nifi.cluster.flow.election.max.wait.time=1 min' }
+        - { regexp: 'nifi.cluster.is.node=.*', line: 'nifi.cluster.is.node=true' }
+        - { regexp: 'nifi.cluster.node.protocol.port=.*', line: 'nifi.cluster.node.protocol.port=9998' }
+
+    - name: Parse keystore and truststore passwords from nifi.properties
+      shell: |
+        grep -E "^(nifi.security.keystorePasswd|nifi.security.truststorePasswd)=" {{ nifi_home }}/conf/nifi.properties
+      register: passwd_lines
+
+    - name: Set keystore and truststore variables
+      set_fact:
+        keystore_password: "{{ passwd_lines.stdout_lines | select('search', '^nifi.security.keystorePasswd=') | list | first | regex_replace('^nifi.security.keystorePasswd=', '') }}"
+        truststore_password: "{{ passwd_lines.stdout_lines | select('search', '^nifi.security.truststorePasswd=') | list | first | regex_replace('^nifi.security.truststorePasswd=', '') }}"
+
+    - name: Debug keystore password before export
+      debug:
+        msg: "Keystore password is {{ keystore_password }}"
+
+    - name: Ensure certs directory exists
+      file:
+        path: "{{ nifi_home }}/certs"
+        state: directory
+        owner: root
+        group: root
+        mode: '0755'
+
+    - name: Delete existing certificates from truststore with aliases slave1-cert or slave2-cert
+      shell: |
+        for alias in slave1-cert slave2-cert; do
+          keytool -delete -alias "$alias" \
+            -keystore {{ nifi_home }}/conf/truststore.p12 \
+            -storepass '{{ truststore_password }}' \
+            -storetype PKCS12 || true
+        done
+
+    - name: Export public certificate from keystore (alias nifi-key)
+      shell: |
+        keytool -export -alias nifi-key \
+          -keystore {{ nifi_home }}/conf/keystore.p12 \
+          -storetype PKCS12 \
+          -storepass '{{ keystore_password }}' \
+          -rfc \
+          -file {{ nifi_home }}/certs/{{ inventory_hostname }}.crt
+
+    - name: Check if certificate was exported correctly
+      stat:
+        path: "{{ nifi_home }}/certs/{{ inventory_hostname }}.crt"
+      register: exported_cert
+
+    - name: Fail if certificate export failed
+      fail:
+        msg: "Certificate export failed for {{ inventory_hostname }}"
+      when: not exported_cert.stat.exists
+
+    - name: Fix permissions so Ansible can write to nifi_home
+      shell: chmod -R 755 {{ nifi_home }}
+
+    - name: Fetch slave2 certificate from slave2 to control node
+      fetch:
+        src: "{{ nifi_home }}/certs/slave2.crt"
+        dest: "/tmp/certs/"
+        flat: yes
+      when: inventory_hostname == "slave2"
+
+    - name: Copy slave2 certificate to slave1
+      copy:
+        src: "/tmp/certs/slave2.crt"
+        dest: "{{ nifi_home }}/certs/slave2.crt"
+      delegate_to: slave1
+      when: inventory_hostname == "slave2"
+
+    - name: Fetch slave1 certificate from slave1 to control node
+      fetch:
+        src: "{{ nifi_home }}/certs/slave1.crt"
+        dest: "/tmp/certs/"
+        flat: yes
+      when: inventory_hostname == "slave1"
+
+    - name: Copy slave1 certificate to slave2
+      copy:
+        src: "/tmp/certs/slave1.crt"
+        dest: "{{ nifi_home }}/certs/slave1.crt"
+      delegate_to: slave2
+      when: inventory_hostname == "slave1"
+
+    - name: Debug cert content after copy
+      shell: cat {{ nifi_home }}/certs/slave1.crt
+      register: cert_output
+      when: inventory_hostname == "slave2"
+
+    - debug:
+        var: cert_output.stdout
+      when: inventory_hostname == "slave2"
+
+    - name: Import slave1 cert to slave2 truststore
+      shell: |
+        keytool -importcert -trustcacerts -noprompt \
+          -alias slave1-cert \
+          -file {{ nifi_home }}/certs/slave1.crt \
+          -keystore {{ nifi_home }}/conf/truststore.p12 \
+          -storepass '{{ truststore_password }}' \
+          -storetype PKCS12
+      when: inventory_hostname == "slave2"
+
+    - name: Import slave2 cert to slave1 truststore
+      shell: |
+        keytool -importcert -trustcacerts -noprompt \
+          -alias slave2-cert \
+          -file {{ nifi_home }}/certs/slave2.crt \
+          -keystore {{ nifi_home }}/conf/truststore.p12 \
+          -storepass '{{ truststore_password }}' \
+          -storetype PKCS12
+      when: inventory_hostname == "slave1"
+
+    - name: Replace state-management.xml with ZooKeeper config
+      copy:
+        dest: "{{ nifi_home }}/conf/state-management.xml"
+        content: |
+          <stateManagement>
+            <local-provider>
+              <id>local-provider</id>
+              <class>org.apache.nifi.controller.state.providers.local.WriteAheadLocalStateProvider</class>
+              <property name="Directory">./state/local</property>
+              <property name="Always Sync">false</property>
+              <property name="Partitions">16</property>
+              <property name="Checkpoint Interval">2 mins</property>
+            </local-provider>
+            <cluster-provider>
+              <id>zk-provider</id>
+              <class>org.apache.nifi.controller.state.providers.zookeeper.ZooKeeperStateProvider</class>
+              <property name="Connect String">master1:2181,master2:2181,master3:2181</property>
+              <property name="Root Node">/nifi</property>
+              <property name="Session Timeout">10 seconds</property>
+              <property name="Access Control">Open</property>
+            </cluster-provider>
+            <stateManagementProvider>
+              <id>zk-provider</id>
+            </stateManagementProvider>
+          </stateManagement>
+
+    - name: Start NiFi
+      shell: "{{ nifi_home }}/bin/nifi.sh start"
+      async: 30
+      poll: 0
+
+    - name: Check NiFi status
+      shell: |
+       sleep 120 && cd {{ nifi_home }}/bin && ./nifi.sh status
+      register: nifi_status
+
+    - name: Show NiFi credentials
+      shell: cat {{ nifi_home }}/logs/*.log | grep Generated
+      register: login_creds
+
+    - name: Print credentials
+      debug:
+        var: login_creds.stdout_lines
